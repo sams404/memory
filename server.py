@@ -1,50 +1,35 @@
 #!/usr/bin/env python3
 """
-Pipeline HTTP Server
-iPhone sends data here → auto-processes → saves to vault
-No SSH needed — simple HTTP from Shortcuts
+Pipeline Server — iPhone connects here via HTTP
+No SSH needed. Just POST from Shortcuts.
 """
 
-import os
-import json
-import base64
-import tempfile
+import os, base64, tempfile, subprocess
 from pathlib import Path
 from flask import Flask, request, jsonify
-from pipeline import process, ensure_vault
+from pipeline import process, ensure_vault, VAULT, FOLDERS
 
 app = Flask(__name__)
-VAULT = Path(os.environ.get("VAULT_PATH", Path.home() / "vault"))
 
-# ── Health check ──────────────────────────────
-
+# ── Health ────────────────────────────────────
 @app.route("/", methods=["GET"])
 def health():
     notes = list(VAULT.rglob("*.md"))
-    return jsonify({
-        "status": "running",
-        "vault": str(VAULT),
-        "notes": len(notes)
-    })
+    folders = {k: len(list((VAULT/v).glob("*.md"))) for k,v in FOLDERS.items() if (VAULT/v).exists()}
+    return jsonify({"status": "✓ running", "total_notes": len(notes), "breakdown": folders})
 
-# ── Main capture endpoint ──────────────────────
-
+# ── Capture anything ──────────────────────────
 @app.route("/capture", methods=["POST"])
 def capture():
-    """
-    Accepts:
-      { "text": "any text or URL" }
-      { "image": "<base64>", "ext": "jpg" }
-      { "audio": "<base64>", "ext": "m4a" }
-      { "file":  "<base64>", "ext": "pdf", "name": "doc.pdf" }
-    """
     data = request.get_json(silent=True) or {}
 
     try:
+        # Text or URL
         if "text" in data:
             out = process(data["text"])
-            return jsonify({"ok": True, "saved": out.name})
+            return jsonify({"ok": True, "saved": out.name, "folder": out.parent.name})
 
+        # Image (base64)
         elif "image" in data:
             ext = data.get("ext", "jpg")
             with tempfile.NamedTemporaryFile(suffix=f".{ext}", delete=False) as f:
@@ -52,8 +37,9 @@ def capture():
                 tmp = f.name
             out = process(tmp)
             os.unlink(tmp)
-            return jsonify({"ok": True, "saved": out.name})
+            return jsonify({"ok": True, "saved": out.name, "folder": out.parent.name})
 
+        # Audio (base64)
         elif "audio" in data:
             ext = data.get("ext", "m4a")
             with tempfile.NamedTemporaryFile(suffix=f".{ext}", delete=False) as f:
@@ -61,8 +47,9 @@ def capture():
                 tmp = f.name
             out = process(tmp)
             os.unlink(tmp)
-            return jsonify({"ok": True, "saved": out.name})
+            return jsonify({"ok": True, "saved": out.name, "folder": out.parent.name})
 
+        # Any file (base64)
         elif "file" in data:
             ext = data.get("ext", "pdf")
             name = data.get("name", f"file.{ext}")
@@ -71,58 +58,48 @@ def capture():
                 tmp = f.name
             out = process(tmp)
             os.unlink(tmp)
-            return jsonify({"ok": True, "saved": out.name})
+            return jsonify({"ok": True, "saved": out.name, "folder": out.parent.name})
 
         else:
-            return jsonify({"ok": False, "error": "No input provided"}), 400
+            return jsonify({"ok": False, "error": "No input"}), 400
 
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
 
-# ── Inbox list ────────────────────────────────
+# ── Weekly review ─────────────────────────────
+@app.route("/review", methods=["GET"])
+def review():
+    try:
+        result = subprocess.run(["python3", "review.py", "week"],
+                                capture_output=True, text=True, timeout=60)
+        return jsonify({"ok": True, "output": result.stdout[-500:]})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
 
+# ── Inbox list ────────────────────────────────
 @app.route("/inbox", methods=["GET"])
 def inbox():
-    inbox_dir = VAULT / "00-Inbox"
-    notes = []
-    for md in sorted(inbox_dir.glob("*.md"), reverse=True)[:10]:
-        notes.append(md.name)
-    return jsonify({"inbox": notes, "count": len(notes)})
-
-# ── Vault stats ───────────────────────────────
-
-@app.route("/stats", methods=["GET"])
-def stats():
-    folders = {
-        "Finance": "01-Finance",
-        "AI": "02-AI",
-        "Languages": "03-Languages",
-        "Projects": "04-Projects",
-        "Knowledge": "05-Knowledge",
-        "Journal": "06-Journal",
-        "Inbox": "00-Inbox",
-    }
-    counts = {}
-    for label, folder in folders.items():
-        d = VAULT / folder
-        counts[label] = len(list(d.glob("*.md"))) if d.exists() else 0
-    return jsonify({"stats": counts, "total": sum(counts.values())})
+    d = VAULT / "00-Inbox"
+    notes = [f.name for f in sorted(d.glob("*.md"), reverse=True)[:10]] if d.exists() else []
+    return jsonify({"count": len(notes), "notes": notes})
 
 
 if __name__ == "__main__":
     ensure_vault()
-    local_ip = os.popen("hostname -I").read().strip().split()[0]
+    ip = os.popen("hostname -I 2>/dev/null").read().strip().split()
+    local_ip = ip[0] if ip else "localhost"
     print(f"""
 ╔══════════════════════════════════════╗
-║   Pipeline Server Running            ║
+║      Pipeline Server — RUNNING       ║
 ╠══════════════════════════════════════╣
-║  Local:   http://localhost:5000      ║
-║  iPhone:  http://{local_ip}:5000     ║
+║  iPhone URL:                         ║
+║  http://{local_ip}:5000        ║
 ╠══════════════════════════════════════╣
 ║  Endpoints:                          ║
-║  POST /capture  — send any content   ║
-║  GET  /inbox    — list inbox         ║
-║  GET  /stats    — vault statistics   ║
+║  GET  /        — vault status        ║
+║  POST /capture — send anything       ║
+║  GET  /inbox   — inbox list          ║
+║  GET  /review  — weekly review       ║
 ╚══════════════════════════════════════╝
 """)
     app.run(host="0.0.0.0", port=5000, debug=False)
