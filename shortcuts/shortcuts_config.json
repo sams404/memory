@@ -1,0 +1,68 @@
+{
+  "server": "http://CHROMEBOOK_IP:5000",
+  "shortcuts": [
+    {
+      "name": "📝 Capture Thought",
+      "trigger": "home screen / widget",
+      "steps": [
+        "Ask for Input → 'What's your thought?'",
+        "Get Contents of URL → POST http://CHROMEBOOK_IP:5000/capture",
+        "Body: { \"text\": \"[input]\" }",
+        "Show Notification → 'Saved to vault'"
+      ]
+    },
+    {
+      "name": "📷 Capture Photo",
+      "trigger": "home screen / share sheet",
+      "steps": [
+        "Take Photo OR Select Photo from library",
+        "Encode to Base64",
+        "Get Contents of URL → POST /capture",
+        "Body: { \"image\": \"[base64]\", \"ext\": \"jpg\" }",
+        "Show Notification → 'Photo analyzed'"
+      ]
+    },
+    {
+      "name": "🎤 Voice Note",
+      "trigger": "home screen",
+      "steps": [
+        "Record Audio",
+        "Encode to Base64",
+        "Get Contents of URL → POST /capture",
+        "Body: { \"audio\": \"[base64]\", \"ext\": \"m4a\" }",
+        "Show Notification → 'Voice note transcribed'"
+      ]
+    },
+    {
+      "name": "🔗 Save Link",
+      "trigger": "Share Sheet (Safari, Chrome, any app)",
+      "steps": [
+        "Get URLs from Share Sheet",
+        "Get Contents of URL → POST /capture",
+        "Body: { \"text\": \"[URL]\" }",
+        "Show Notification → 'Link saved'"
+      ]
+    },
+    {
+      "name": "📄 Send File",
+      "trigger": "Share Sheet (Files, Mail, any app)",
+      "steps": [
+        "Get file from Share Sheet input",
+        "Encode to Base64",
+        "Get file extension",
+        "Get Contents of URL → POST /capture",
+        "Body: { \"file\": \"[base64]\", \"ext\": \"[ext]\", \"name\": \"[filename]\" }",
+        "Show Notification → 'File processed'"
+      ]
+    },
+    {
+      "name": "📊 Vault Stats",
+      "trigger": "home screen",
+      "steps": [
+        "Get Contents of URL → GET http://CHROMEBOOK_IP:5000/stats",
+        "Show result as alert"
+      ]
+    }
+  ],
+  "setup_note": "Replace CHROMEBOOK_IP with your Chromebook's local IP. Run 'hostname -I' on Chromebook to find it."
+}
