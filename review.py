@@ -1,80 +1,62 @@
 #!/usr/bin/env python3
-"""
-Weekly & Monthly Review Generator
-Analyzes your vault → finds patterns → generates growth insights
-"""
+"""Weekly & Monthly Review — powered by Gemini"""
 
-import os, re, json
+import os, re
 from datetime import datetime, timedelta
 from pathlib import Path
-import anthropic
+import google.generativeai as genai
 
 VAULT  = Path(os.environ.get("VAULT_PATH", Path.home() / "vault"))
-MODEL  = "claude-opus-4-6"
-client = anthropic.Anthropic()
+genai.configure(api_key=os.environ.get("GEMINI_API_KEY", ""))
+client = genai.GenerativeModel("gemini-2.0-flash")
 
-def load_recent_notes(days=7):
+def load_recent(days=7):
     cutoff = datetime.now() - timedelta(days=days)
     notes  = []
     for md in VAULT.rglob("*.md"):
-        if md.name in ("PROFILE.md",): continue
+        if md.name == "PROFILE.md": continue
         try:
-            mtime = datetime.fromtimestamp(md.stat().st_mtime)
-            if mtime >= cutoff:
-                notes.append(md.read_text(errors="ignore")[:800])
+            if datetime.fromtimestamp(md.stat().st_mtime) >= cutoff:
+                notes.append(md.read_text(errors="ignore")[:600])
         except: pass
     return notes
 
 def generate_review(period="week"):
     days  = 7 if period == "week" else 30
-    notes = load_recent_notes(days)
+    notes = load_recent(days)
     if not notes:
-        print("No notes found for this period."); return
+        print("No notes found."); return
 
-    combined = "\n---\n".join(notes)
-    date     = datetime.now().strftime("%Y-%m-%d")
+    print(f"▶ Analyzing {len(notes)} notes...")
+    date = datetime.now().strftime("%Y-%m-%d")
 
-    print(f"▶ Analyzing {len(notes)} notes from last {days} days...")
-
-    with client.messages.stream(
-        model=MODEL, max_tokens=2048,
-        thinking={"type": "adaptive"},
-        messages=[{"role": "user", "content": f"""You are a personal growth coach analyzing someone's journal.
+    resp = client.generate_content(f"""Personal growth coach analyzing journal entries.
 
 NOTES FROM LAST {days} DAYS:
-{combined[:12000]}
+{"---".join(notes)[:10000]}
 
-Generate a {'weekly' if period == 'week' else 'monthly'} review in markdown:
+Write a {'weekly' if period == 'week' else 'monthly'} review in markdown:
 
-## Pattern Recognition
-(what themes and patterns appear repeatedly)
+## Patterns
+(recurring themes and behaviors)
 
 ## Growth Moments
-(specific wins, breakthroughs, progress)
+(wins, breakthroughs, progress)
 
-## Lessons Learned
-(key insights from this period)
+## Key Lessons
+(insights from this period)
 
-## Energy & Mood Trends
-(how mood/energy shifted and why)
+## Mood & Energy Trends
 
 ## What's Working
-(habits, approaches giving results)
 
 ## What Needs Attention
-(blockers, unresolved issues, neglected areas)
 
-## Focus for Next {'Week' if period == 'week' else 'Month'}
-(1-3 specific priorities based on patterns)
+## Next {'Week' if period == 'week' else 'Month'} Focus
+(1-3 specific priorities)
 
-## One Sentence Summary
-(capture the essence of this period)
+## One Sentence Summary""")
 
-Be specific, reference actual notes, give real growth insights."""}]
-    ) as s:
-        review_text = s.get_final_message().content[-1].text
-
-    # Save review
     folder = VAULT / "06-Reviews"
     folder.mkdir(exist_ok=True)
     out = folder / f"{date}-{period}-review.md"
@@ -86,13 +68,11 @@ period: {period}
 notes_analyzed: {len(notes)}
 ---
 
-{review_text}
+{resp.text}
 """)
-    print(f"\n✓ Review saved: {out.name}")
-    print("\n" + "="*50)
-    print(review_text)
+    print(f"\n✓ Saved: {out.name}\n")
+    print(resp.text)
 
 if __name__ == "__main__":
     import sys
-    period = sys.argv[1] if len(sys.argv) > 1 else "week"
-    generate_review(period)
+    generate_review(sys.argv[1] if len(sys.argv) > 1 else "week")

@@ -1,4 +1,4 @@
-anthropic
+google-generativeai
 pdfplumber
-openai-whisper
 pypdf
+flask
