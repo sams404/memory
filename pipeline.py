@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
 Universal Information Pipeline
+Semantic sorting + auto-linking for Obsidian, Notion, NotebookLM
 Handles: photos, text, files, audio, links, books
-Outputs: Obsidian vault notes with analysis
 """
 
 import os
@@ -10,20 +10,19 @@ import sys
 import base64
 import json
 import mimetypes
-import hashlib
 import re
-import tempfile
+import urllib.request
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
 
 import anthropic
 
 # ─── CONFIG ───────────────────────────────────────────────────────────────────
 
-VAULT_PATH = Path(os.environ.get("VAULT_PATH", Path.home() / "vault"))
-MODEL = "claude-opus-4-6"
-PROFILE_PATH = VAULT_PATH / "PROFILE.md"
+VAULT_PATH   = Path(os.environ.get("VAULT_PATH", Path.home() / "vault"))
+NOTION_TOKEN = os.environ.get("NOTION_TOKEN", "")
+NOTION_DB_ID = os.environ.get("NOTION_DB_ID", "")
+MODEL        = "claude-opus-4-6"
 
 FOLDER_MAP = {
     "finance":   "01-Finance",
@@ -36,10 +35,10 @@ FOLDER_MAP = {
 }
 
 USER_INTERESTS = """
-- Finance & investing (Norway context: aksjesparekonto, DNB, Vipps)
+- Finance & investing (Norway: aksjesparekonto, DNB, Vipps)
 - AI projects and automation
 - English and Norwegian language learning
-- Online business
+- Online business and income streams
 """
 
 client = anthropic.Anthropic()
@@ -61,78 +60,126 @@ def note_path(category: str, title: str) -> Path:
 
 # ─── INPUT EXTRACTION ─────────────────────────────────────────────────────────
 
-def extract_text_file(path: Path) -> str:
-    return path.read_text(errors="ignore")
-
 def extract_image_b64(path: Path) -> tuple[str, str]:
     mime = mimetypes.guess_type(str(path))[0] or "image/jpeg"
     data = base64.standard_b64encode(path.read_bytes()).decode()
     return data, mime
 
 def extract_audio(path: Path) -> str:
-    """Transcribe audio using whisper."""
     try:
         import whisper
-        model = whisper.load_model("base")
-        result = model.transcribe(str(path))
+        print("   Transcribing audio...")
+        result = whisper.load_model("base").transcribe(str(path))
         return result["text"]
     except ImportError:
-        return f"[Audio file: {path.name} — install whisper: pip install openai-whisper]"
+        return f"[Audio: {path.name} — pip install openai-whisper]"
 
 def extract_pdf(path: Path) -> str:
     try:
         import pdfplumber
         text = ""
         with pdfplumber.open(path) as pdf:
-            for page in pdf.pages[:50]:  # max 50 pages
+            for page in pdf.pages[:50]:
                 text += page.extract_text() or ""
         return text
     except ImportError:
         try:
             import pypdf
-            reader = pypdf.PdfReader(str(path))
-            return "\n".join(p.extract_text() for p in reader.pages[:50])
+            return "\n".join(p.extract_text() for p in pypdf.PdfReader(str(path)).pages[:50])
         except ImportError:
-            return f"[PDF: {path.name} — install: pip install pdfplumber]"
+            return f"[PDF: {path.name} — pip install pdfplumber]"
 
 def extract_url(url: str) -> str:
-    import urllib.request
     try:
         req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
         with urllib.request.urlopen(req, timeout=15) as r:
             html = r.read().decode(errors="ignore")
-        # strip tags
         text = re.sub(r"<script[^>]*>.*?</script>", "", html, flags=re.DOTALL)
         text = re.sub(r"<style[^>]*>.*?</style>", "", text, flags=re.DOTALL)
         text = re.sub(r"<[^>]+>", " ", text)
-        text = re.sub(r"\s+", " ", text)
-        return text[:8000]
+        return re.sub(r"\s+", " ", text)[:8000]
     except Exception as e:
         return f"[Fetch failed: {e}]"
+
+# ─── SEMANTIC LINKING ─────────────────────────────────────────────────────────
+
+def get_vault_index() -> str:
+    """Read titles + insights of existing notes for semantic comparison."""
+    index = []
+    for md in VAULT_PATH.rglob("*.md"):
+        if md.name == "PROFILE.md":
+            continue
+        content = md.read_text(errors="ignore")
+        title_m = re.search(r"^title:\s*(.+)$", content, re.MULTILINE)
+        insight_m = re.search(r"## Key Insight\n(.+)", content)
+        summary_m = re.search(r"## Summary\n((?:- .+\n?)+)", content)
+        if title_m:
+            entry = f"[[{md.stem}]] — {title_m.group(1).strip()}"
+            if insight_m:
+                entry += f": {insight_m.group(1).strip()}"
+            elif summary_m:
+                entry += f": {summary_m.group(1).strip().split(chr(10))[0]}"
+            index.append(entry)
+    return "\n".join(index[-80:])
+
+def find_semantic_links(analysis: dict) -> list[str]:
+    """Use Claude to find conceptually related existing notes."""
+    vault_index = get_vault_index()
+    if not vault_index:
+        return []
+
+    prompt = f"""Find notes semantically related to this new note by CONCEPT or THEME.
+
+NEW NOTE:
+Title: {analysis.get('title')}
+Category: {analysis.get('category')}
+Tags: {analysis.get('tags')}
+Insight: {analysis.get('key_insight')}
+
+EXISTING NOTES:
+{vault_index}
+
+Return ONLY a JSON array of 2-4 note stems (no [[brackets]]):
+["note-stem-1", "note-stem-2"]
+
+Return [] if nothing is truly related."""
+
+    resp = client.messages.create(
+        model=MODEL,
+        max_tokens=256,
+        messages=[{"role": "user", "content": prompt}]
+    )
+    text = resp.content[0].text
+    match = re.search(r"\[.*?\]", text, re.DOTALL)
+    if match:
+        try:
+            return [f"[[{l}]]" for l in json.loads(match.group()) if l]
+        except Exception:
+            pass
+    return []
 
 # ─── CLAUDE ANALYSIS ──────────────────────────────────────────────────────────
 
 def analyze_text(content: str, source_hint: str = "") -> dict:
-    """Classify, summarize, and score relevance."""
-    prompt = f"""You are analyzing content for a personal knowledge vault.
+    prompt = f"""Analyze this content for a personal knowledge vault.
 
 USER INTERESTS:
 {USER_INTERESTS}
 
-SOURCE HINT: {source_hint}
-
+SOURCE: {source_hint}
 CONTENT:
 {content[:6000]}
 
-Respond with ONLY valid JSON:
+Return ONLY valid JSON:
 {{
-  "title": "short descriptive title (max 8 words)",
+  "title": "descriptive title (max 8 words)",
   "category": "finance|ai|language|project|knowledge|journal",
-  "tags": ["tag1", "tag2"],
+  "tags": ["tag1", "tag2", "tag3"],
   "relevance": 1-10,
   "action_required": true|false,
-  "summary": ["bullet 1", "bullet 2", "bullet 3"],
-  "key_insight": "one sentence takeaway"
+  "summary": ["point 1", "point 2", "point 3"],
+  "key_insight": "one sentence core takeaway",
+  "notion_status": "To Process|In Progress|Done|Reference"
 }}"""
 
     with client.messages.stream(
@@ -143,48 +190,37 @@ Respond with ONLY valid JSON:
     ) as stream:
         text = stream.get_final_message().content[-1].text
 
-    # extract JSON
     match = re.search(r"\{.*\}", text, re.DOTALL)
     if match:
         return json.loads(match.group())
     return {"title": "Untitled", "category": "inbox", "tags": [], "relevance": 5,
-            "action_required": False, "summary": [text[:200]], "key_insight": ""}
+            "action_required": False, "summary": [], "key_insight": "",
+            "notion_status": "To Process"}
 
 def analyze_image(b64: str, mime: str) -> dict:
-    """Analyze image content with Claude Vision."""
     with client.messages.stream(
         model=MODEL,
         max_tokens=1024,
-        messages=[{
-            "role": "user",
-            "content": [
-                {
-                    "type": "image",
-                    "source": {"type": "base64", "media_type": mime, "data": b64}
-                },
-                {
-                    "type": "text",
-                    "text": f"""Analyze this image for a personal knowledge vault.
+        messages=[{"role": "user", "content": [
+            {"type": "image", "source": {"type": "base64", "media_type": mime, "data": b64}},
+            {"type": "text", "text": f"""Analyze this image for a personal knowledge vault.
 
 USER INTERESTS:
 {USER_INTERESTS}
 
-Extract all text visible. Describe what you see. Classify and summarize.
-
-Respond with ONLY valid JSON:
+Return ONLY valid JSON:
 {{
-  "title": "short descriptive title",
+  "title": "descriptive title",
   "category": "finance|ai|language|project|knowledge|journal",
   "tags": ["tag1", "tag2"],
   "relevance": 1-10,
   "action_required": true|false,
-  "extracted_text": "all text visible in image",
-  "summary": ["what this image shows"],
-  "key_insight": "one sentence takeaway"
-}}"""
-                }
-            ]
-        }],
+  "extracted_text": "all visible text in image",
+  "summary": ["what this shows"],
+  "key_insight": "one sentence takeaway",
+  "notion_status": "To Process|Reference"
+}}"""}
+        ]}],
     ) as stream:
         text = stream.get_final_message().content[-1].text
 
@@ -192,150 +228,141 @@ Respond with ONLY valid JSON:
     if match:
         return json.loads(match.group())
     return {"title": "Image", "category": "inbox", "tags": [], "relevance": 5,
-            "action_required": False, "extracted_text": "", "summary": [], "key_insight": ""}
+            "action_required": False, "extracted_text": "", "summary": [],
+            "key_insight": "", "notion_status": "To Process"}
 
 # ─── NOTE BUILDER ─────────────────────────────────────────────────────────────
 
-def build_note(analysis: dict, source: str, raw_content: str = "") -> str:
+def build_note(analysis: dict, source: str, raw: str, links: list[str]) -> str:
     date = datetime.now().strftime("%Y-%m-%d")
-    tags = " ".join(f"#{t}" for t in analysis.get("tags", []))
-    summary_bullets = "\n".join(f"- {s}" for s in analysis.get("summary", []))
-    action = "true" if analysis.get("action_required") else "false"
+    summary = "\n".join(f"- {s}" for s in analysis.get("summary", []))
 
-    frontmatter = f"""---
+    note = f"""---
 title: {analysis.get('title', 'Untitled')}
 date: {date}
 type: {analysis.get('category', 'inbox')}
 tags: [{', '.join(analysis.get('tags', []))}]
 source: {source}
 relevance: {analysis.get('relevance', 5)}/10
-action_required: {action}
+action_required: {str(analysis.get('action_required', False)).lower()}
 status: new
----"""
+---
 
-    body = f"""
 ## Summary
-{summary_bullets}
+{summary}
 
 ## Key Insight
 {analysis.get('key_insight', '')}
 """
-
     if analysis.get("extracted_text"):
-        body += f"\n## Extracted Text\n{analysis['extracted_text']}\n"
+        note += f"\n## Extracted Text\n{analysis['extracted_text']}\n"
 
-    if raw_content and len(raw_content) < 2000:
-        body += f"\n## Source Content\n{raw_content[:2000]}\n"
+    if links:
+        note += "\n## Related\n" + "\n".join(links) + "\n"
 
-    return frontmatter + body
+    if raw and len(raw) < 1500:
+        note += f"\n## Source\n{raw}\n"
 
-# ─── FIND RELATED NOTES ───────────────────────────────────────────────────────
+    return note
 
-def find_related(tags: list[str], title: str) -> list[str]:
-    related = []
-    keywords = tags + title.lower().split()[:3]
-    for md in VAULT_PATH.rglob("*.md"):
-        content = md.read_text(errors="ignore").lower()
-        if any(kw in content for kw in keywords):
-            related.append(f"[[{md.stem}]]")
-        if len(related) >= 3:
-            break
-    return related
+# ─── NOTION INTEGRATION ───────────────────────────────────────────────────────
+
+def push_to_notion(analysis: dict, source: str, note_file: str):
+    if not NOTION_TOKEN or not NOTION_DB_ID:
+        return
+
+    props = {
+        "Name": {"title": [{"text": {"content": analysis.get("title", "Untitled")}}]},
+        "Category": {"select": {"name": analysis.get("category", "inbox").capitalize()}},
+        "Tags": {"multi_select": [{"name": t} for t in analysis.get("tags", [])[:5]]},
+        "Relevance": {"number": analysis.get("relevance", 5)},
+        "Action Required": {"checkbox": bool(analysis.get("action_required"))},
+        "Status": {"select": {"name": analysis.get("notion_status", "To Process")}},
+        "Insight": {"rich_text": [{"text": {"content": analysis.get("key_insight", "")[:2000]}}]},
+        "Obsidian": {"rich_text": [{"text": {"content": note_file}}]},
+    }
+    if source.startswith("http"):
+        props["Source"] = {"url": source}
+
+    data = json.dumps({"parent": {"database_id": NOTION_DB_ID}, "properties": props}).encode()
+    req = urllib.request.Request(
+        "https://api.notion.com/v1/pages",
+        data=data,
+        headers={
+            "Authorization": f"Bearer {NOTION_TOKEN}",
+            "Content-Type": "application/json",
+            "Notion-Version": "2022-06-28",
+        },
+        method="POST"
+    )
+    try:
+        urllib.request.urlopen(req, timeout=10)
+        print("   Notion: synced ✓")
+    except Exception as e:
+        print(f"   Notion: failed — {e}")
 
 # ─── MAIN PROCESSOR ───────────────────────────────────────────────────────────
 
 def process(input_str: str) -> Path:
-    """Process any input: file path, URL, or raw text."""
     ensure_vault()
     path = Path(input_str)
     is_url = input_str.startswith(("http://", "https://"))
 
-    print(f"\n Processing: {input_str[:60]}...")
+    print(f"\n▶ {input_str[:70]}")
 
-    # ── Detect type ──
     if path.exists() and path.is_file():
         suffix = path.suffix.lower()
-
         if suffix in {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"}:
-            print("   Type: Image")
+            print("  Type: Image")
             b64, mime = extract_image_b64(path)
             analysis = analyze_image(b64, mime)
-            source = str(path)
-            raw = analysis.get("extracted_text", "")
-
+            source, raw = str(path), analysis.get("extracted_text", "")
         elif suffix in {".mp3", ".wav", ".m4a", ".ogg", ".flac", ".webm"}:
-            print("   Type: Audio — transcribing...")
+            print("  Type: Audio")
             transcript = extract_audio(path)
-            analysis = analyze_text(transcript, source_hint=f"audio: {path.name}")
-            source = str(path)
-            raw = transcript[:2000]
-
+            analysis = analyze_text(transcript, f"audio: {path.name}")
+            source, raw = str(path), transcript[:1500]
         elif suffix == ".pdf":
-            print("   Type: PDF")
+            print("  Type: PDF")
             text = extract_pdf(path)
-            analysis = analyze_text(text, source_hint=f"pdf: {path.name}")
-            source = str(path)
-            raw = text[:2000]
-
-        elif suffix in {".txt", ".md", ".rst", ".csv", ".json", ".html"}:
-            print("   Type: Text file")
-            text = extract_text_file(path)
-            analysis = analyze_text(text, source_hint=f"file: {path.name}")
-            source = str(path)
-            raw = text[:2000]
-
-        elif suffix in {".epub", ".mobi"}:
-            print("   Type: Book — processing as text")
-            text = extract_text_file(path)
-            analysis = analyze_text(text[:10000], source_hint=f"book: {path.name}")
-            source = str(path)
-            raw = text[:2000]
-
+            analysis = analyze_text(text, f"pdf: {path.name}")
+            source, raw = str(path), text[:1500]
         else:
-            print("   Type: Unknown file — treating as text")
-            text = extract_text_file(path)
-            analysis = analyze_text(text, source_hint=path.name)
-            source = str(path)
-            raw = text[:2000]
-
+            print("  Type: File")
+            text = path.read_text(errors="ignore")
+            analysis = analyze_text(text, f"file: {path.name}")
+            source, raw = str(path), text[:1500]
     elif is_url:
-        print("   Type: URL — fetching...")
+        print("  Type: URL")
         text = extract_url(input_str)
-        analysis = analyze_text(text, source_hint=f"url: {input_str}")
-        source = input_str
-        raw = text[:2000]
-
+        analysis = analyze_text(text, f"url: {input_str}")
+        source, raw = input_str, text[:1500]
     else:
-        print("   Type: Text / Thought")
-        analysis = analyze_text(input_str, source_hint="direct input")
-        source = "direct input"
-        raw = input_str
+        print("  Type: Text")
+        analysis = analyze_text(input_str, "direct input")
+        source, raw = "direct input", input_str
 
-    # ── Build & save note ──
-    related = find_related(analysis.get("tags", []), analysis.get("title", ""))
-    note = build_note(analysis, source, raw)
-    if related:
-        note += f"\n## Related\n" + "\n".join(related) + "\n"
+    print("  Finding semantic links...")
+    links = find_semantic_links(analysis)
 
-    out_path = note_path(analysis.get("category", "inbox"), analysis.get("title", "note"))
-    out_path.write_text(note)
+    note = build_note(analysis, source, raw, links)
+    out = note_path(analysis.get("category", "inbox"), analysis.get("title", "note"))
+    out.write_text(note)
 
-    # ── Report ──
-    relevance = analysis.get("relevance", 0)
-    print(f"\n DONE")
-    print(f"   Title:     {analysis.get('title')}")
-    print(f"   Category:  {analysis.get('category')} ({FOLDER_MAP.get(analysis.get('category','inbox'),'00-Inbox')})")
-    print(f"   Relevance: {relevance}/10")
-    print(f"   Action:    {'YES' if analysis.get('action_required') else 'no'}")
-    print(f"   Saved:     {out_path}")
+    push_to_notion(analysis, source, out.name)
 
-    if relevance < 4:
-        print(f"   ⚠  Low relevance ({relevance}/10) — saved to inbox anyway")
+    folder = FOLDER_MAP.get(analysis.get("category", "inbox"), "00-Inbox")
+    print(f"""
+✓ Saved
+  Title:     {analysis.get('title')}
+  Folder:    {folder}
+  Relevance: {analysis.get('relevance')}/10
+  Action:    {'YES ⚡' if analysis.get('action_required') else 'no'}
+  Links:     {', '.join(links) if links else 'none found'}
+  File:      {out.name}""")
 
-    return out_path
+    return out
 
-
-# ─── CLI ──────────────────────────────────────────────────────────────────────
 
 def main():
     if len(sys.argv) < 2:
@@ -343,15 +370,16 @@ def main():
 Usage:
   python pipeline.py <input>
 
-Input can be:
-  - File path:   /path/to/photo.jpg
-  - URL:         https://example.com/article
-  - Text:        "My idea about X..."
-  - Multiple:    python pipeline.py file1.pdf file2.jpg https://...
+  photo.jpg / voice.m4a / doc.pdf / https://... / "any text"
 
-Environment:
-  VAULT_PATH   Path to Obsidian vault (default: ~/vault)
-  ANTHROPIC_API_KEY  Your API key
+  Multiple:
+  python pipeline.py file1.pdf photo.jpg https://... "idea"
+
+Env vars:
+  VAULT_PATH        path to Obsidian vault (default: ~/vault)
+  ANTHROPIC_API_KEY
+  NOTION_TOKEN      optional
+  NOTION_DB_ID      optional
 """)
         sys.exit(1)
 
@@ -359,9 +387,8 @@ Environment:
         try:
             process(inp.strip())
         except Exception as e:
-            print(f"\n  Error processing '{inp}': {e}")
-            import traceback
-            traceback.print_exc()
+            print(f"\n✗ Error: {e}")
+            import traceback; traceback.print_exc()
 
 
 if __name__ == "__main__":
