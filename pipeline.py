@@ -38,6 +38,25 @@ TEMPLATES = {
     "knowledge": "## Summary\n{content}\n\n## Key insight\n{key_insight}\n\n## How this applies to me\n-\n",
 }
 
+def git_push(note_file: Path):
+    """Auto-push new note to GitHub so iPhone gets it instantly."""
+    import subprocess
+    try:
+        token = os.popen("gh auth token 2>/dev/null").read().strip()
+        remote = f"https://{token}@github.com/sams404/memory.git" if token else None
+        cmds = [
+            ["git", "-C", str(VAULT), "init"],
+            ["git", "-C", str(VAULT), "add", str(note_file)],
+            ["git", "-C", str(VAULT), "commit", "-m", f"note: {note_file.name}"],
+        ]
+        if remote:
+            cmds.append(["git", "-C", str(VAULT), "push", remote, "HEAD:master", "--force"])
+        for cmd in cmds:
+            subprocess.run(cmd, capture_output=True)
+        print("  GitHub: synced ✓")
+    except Exception as e:
+        print(f"  GitHub: {e}")
+
 def ensure_vault():
     VAULT.mkdir(parents=True, exist_ok=True)
     for f in FOLDERS.values():
@@ -203,6 +222,7 @@ def process(inp):
     note  = build_note(a, source, raw, links)
     out   = note_path(a.get("category","inbox"), a.get("title","note"))
     out.write_text(note)
+    git_push(out)
 
     print(f"""
 ✓ Saved
